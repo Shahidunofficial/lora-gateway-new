@@ -1,8 +1,10 @@
 from flask import Blueprint, request, jsonify
 from controller.gatewayController import GatewayController
+from helper.mqtt_manager import MQTTManager
 
 gateway_blueprint = Blueprint('gateway', __name__)
-gateway_controller = GatewayController()
+mqtt_manager_instance = MQTTManager()  # Get the singleton instance
+gateway_controller = GatewayController(mqtt_manager_instance)
 
 @gateway_blueprint.route('/register', methods=['POST'])
 def register_gateway():

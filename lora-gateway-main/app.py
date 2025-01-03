@@ -1,97 +1,39 @@
 from flask import Flask
-from flask_pymongo import PyMongo
-from mongoengine import connect
-from pymongo.errors import ServerSelectionTimeoutError
-from dotenv import load_dotenv
-import os
-import time
-from router.nodeRoutes import node_blueprint
-from router.gatewayRoutes import gateway_blueprint
 from flask_cors import CORS
 import logging
-import socketio
+import os
 import socket
-import sys
+from dotenv import load_dotenv
+import socketio
+from router.nodeRoutes import node_blueprint
+from router.gatewayRoutes import gateway_blueprint, mqtt_manager_instance
 import threading
-import atexit
-from controller.nodeController import NodeController
-from config import MONGODB_URL
-from helper.gateway_storage import GatewayStorage
-from flask_socketio import SocketIO
-from mqtt_manager import mqtt_manager_instance
+from controller_instance import init_controller, get_controller
+import time
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
-mongo = PyMongo()
 
-# Initialize Socket.IO client
-sio = socketio.Client(logger=True, engineio_logger=True)
-
-# Create a single instance of NodeController
-sensor_thread = None
-
-
-
-def start_sensor_monitoring():
-    gateway_storage = GatewayStorage()
-    
-    if not gateway_storage.is_enrolled():
-        logging.warning("Gateway not enrolled, skipping sensor monitoring")
-        return
-        
-    if not mqtt_manager_instance.connect():
-        logging.error("Failed to connect to MQTT broker")
-        return
-    
-    # Get the controller instance from controller_instance instead of creating a new one
-    from controller_instance import get_controller
-    controller = get_controller()
-    retry_count = 0
-    max_retries = 3  # Add maximum retry attempts
-    
-    while True:
-        try:
-            if controller.pause_sensor_request.is_set():
-                logging.debug("Sensor monitoring paused")
-                time.sleep(2)
-                continue
-            
-            controller.periodic_sensor_data_request()
-            retry_count = 0  # Reset retry count on successful operation
-            time.sleep(1)
-                
-        except PermissionError as e:
-            retry_count += 1
-            if retry_count >= max_retries:
-                logging.error(f"Failed to access serial port after {max_retries} attempts. Please check if COM5 is available and you have proper permissions.")
-                time.sleep(30)  # Wait longer before trying again
-                retry_count = 0
-            else:
-                logging.warning(f"Permission error accessing serial port (attempt {retry_count}/{max_retries}): {str(e)}")
-                time.sleep(5)  # Wait before retry
-        except Exception as e:
-            logging.error(f"Error in sensor monitoring loop: {str(e)}")
-            time.sleep(2)
-def configure_app():
-    app.config["MONGO_URI"] = MONGODB_URL
-    mongo.init_app(app)
-    logging.info("MongoDB configured successfully")
-    
-    # Initialize controller before registering blueprints
-    from controller_instance import init_controller
-    init_controller(mqtt_manager_instance)
-    
-    # Register blueprints
-    app.register_blueprint(node_blueprint, url_prefix='/api/nodes')
-    app.register_blueprint(gateway_blueprint, url_prefix='/api/gateway')
-    logging.info("Route blueprints registered successfully")
+# Initialize Socket.IO client for connecting to main server
+sio = socketio.Client(
+    logger=True,
+    engineio_logger=True,
+    reconnection=True,
+    reconnection_attempts=0,  # Infinite retries
+    reconnection_delay=1,
+    reconnection_delay_max=5,
+    randomization_factor=0.5,
+    handle_sigint=False
+)
 
 def get_local_ip():
-    """Get the local IP address of the gateway"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -102,79 +44,129 @@ def get_local_ip():
         logging.error(f"Error getting local IP: {e}")
         return "127.0.0.1"
 
-def connect_to_websocket_server():
-    """Connect to WebSocket server and register gateway"""
-    try:
-        # Use WebSocket transport explicitly
-        sio.disconnect()  # Ensure clean reconnection
-        websocket_url = os.getenv('EXPRESS_SERVER_URL', 'ws://localhost:1886')  # Updated port to match server
-        sio.connect(
-            websocket_url,
-            transports=['websocket'],
-            wait_timeout=10
-        )
-        
-        # Prepare gateway registration data to match server expectations
-        gateway_data = {
-            "gatewayId": os.getenv('GATEWAY_ID', 'G100101'),
-            "ipAddress": get_local_ip(),
-            "port": int(os.getenv('PORT', 8080))
-        }
-        
-        # Emit registration event
-        sio.emit('register_device', gateway_data)
-        logging.info(f"Gateway registered with WebSocket server: {gateway_data}")
-        
-    except Exception as e:
-        logging.error(f"Error connecting to WebSocket server: {e}")
-
-@sio.event
-def connect():
-    logging.info("Connected to WebSocket server")
-
-@sio.event
-def disconnect():
-    logging.info("Disconnected from WebSocket server")
-    # Implement exponential backoff for reconnection
-    retry_delay = 5
-    max_retries = 5
-    retry_count = 0
-    
-    while retry_count < max_retries:
+def connect_to_server():
+    while True:  # Keep trying to connect
         try:
-            logging.info(f"Attempting to reconnect... (Attempt {retry_count + 1}/{max_retries})")
-            connect_to_websocket_server()
-            break
+            websocket_url = os.getenv('WEBSOCKET_SERVER_URL', 'http://192.168.43.231:5000')
+            logging.info(f"Attempting to connect to server at {websocket_url}")
+            
+            @sio.event
+            def connect():
+                logging.info("Connected to WebSocket server")
+                # Register gateway
+                gateway_data = {
+                    "gatewayId": os.getenv('GATEWAY_ID', 'G100101'),
+                    "ipAddress": get_local_ip(),
+                    "port": int(os.getenv('PORT', 8080))
+                }
+                sio.emit('register_device', gateway_data)
+                logging.info(f"Emitted register_device with data: {gateway_data}")
+            
+            @sio.event
+            def connect_error(data):
+                logging.error(f"Connection failed: {data}")
+            
+            @sio.event
+            def disconnect():
+                logging.warning("Disconnected from server")
+            
+            # Connect with explicit transport and options
+            sio.connect(
+                websocket_url,
+                transports=['websocket', 'polling'],
+                wait_timeout=10,
+                wait=True,
+                socketio_path='socket.io'
+            )
+            break  # If connection successful, break the loop
+            
         except Exception as e:
-            logging.error(f"Reconnection failed: {e}")
-            retry_count += 1
-            time.sleep(retry_delay)
-            retry_delay *= 2  # Exponential backoff
+            logging.error(f"Error connecting to server: {str(e)}")
+            time.sleep(5)  # Wait before retrying
 
-def main():
-    load_dotenv()
-    configure_app()
-    
-    # Register cleanup function
-    connect_to_websocket_server()
-    # Start sensor monitoring in a separate thread if gateway is enrolled
-    gateway_storage = GatewayStorage()
-    if gateway_storage.is_enrolled():
-        
-        sensor_thread = threading.Thread(target=start_sensor_monitoring, daemon=True)
-        sensor_thread.start()
-        logging.info("Sensor monitoring thread started")
-    
-    # Start the Flask app
-    port = int(os.getenv('PORT', 8080))
-    host = os.getenv('HOST', '0.0.0.0')
-    debug = os.getenv('DEBUG', 'True').lower() == 'true'
-    
+def start_sensor_monitoring():
     try:
-        app.run(host=host, port=port, debug=debug, use_reloader=False)
+        logging.info("Initializing sensor monitoring thread...")
+        controller = get_controller()
+        logging.info("Controller obtained successfully in sensor thread")
+        
+        while True:
+            try:
+                if controller.pause_sensor_request.is_set():
+                    logging.info("Sensor request is paused, waiting...")
+                    time.sleep(1)
+                    continue
+                    
+                nodes = controller.node_model.get_all_nodes()
+                if nodes:
+                    logging.info(f"Found {len(nodes)} nodes to monitor")
+                    controller.periodic_sensor_data_request()
+                else:
+                    logging.info("No nodes found to monitor")
+                    time.sleep(5)
+                    
+            except Exception as e:
+                logging.error(f"Error in sensor monitoring: {e}")
+                time.sleep(5)
+                
     except Exception as e:
-        logging.error(f"Error running Flask app: {e}")
-        sys.exit(1)
+        logging.error(f"Fatal error in sensor monitoring thread: {str(e)}")
+        raise
+
+def configure_app():
+    try:
+        success = True
+        
+        # Initialize controller
+        init_controller(mqtt_manager_instance)
+        logging.info("Controller initialized successfully")
+        
+        # Register blueprints
+        app.register_blueprint(node_blueprint, url_prefix='/api/nodes')
+        app.register_blueprint(gateway_blueprint, url_prefix='/api/gateway')
+        logging.info("Route blueprints registered successfully")
+        
+        # Start sensor monitoring thread
+        try:
+            sensor_thread = threading.Thread(target=start_sensor_monitoring, daemon=True)
+            sensor_thread.start()
+            time.sleep(1)  # Give thread time to start
+            if sensor_thread.is_alive():
+                logging.info("Sensor monitoring thread started successfully")
+            else:
+                logging.error("Sensor monitoring thread failed to start")
+                success = False
+        except Exception as e:
+            logging.error(f"Failed to start sensor thread: {str(e)}")
+            success = False
+        
+        return success
+    except Exception as e:
+        logging.error(f"Error in configure_app: {str(e)}")
+        return False
 
 if __name__ == '__main__':
-    main()
+    try:
+        load_dotenv()
+        if not configure_app():
+            logging.warning("Application configured with limited functionality")
+        
+        # Connect to server for IP registration in a separate thread
+        server_thread = threading.Thread(target=connect_to_server, daemon=True)
+        server_thread.start()
+        logging.info("Server connection thread started")
+        
+        # Start Flask app
+        host = '0.0.0.0'
+        port = int(os.getenv('PORT', 8080))
+        debug = os.getenv('DEBUG', 'True').lower() == 'true'
+        
+        logging.info(f"Starting server on {host}:{port}")
+        app.run(
+            host=host,
+            port=port,
+            debug=True,
+            use_reloader=False
+        )
+    except Exception as e:
+        logging.error(f"Error starting server: {str(e)}")

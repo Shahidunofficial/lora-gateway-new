@@ -11,6 +11,7 @@ from serial import SerialException
 import binascii
 import json
 from datetime import datetime, timezone
+from threading import Lock, Event
 
 class NodeController:
     def __init__(self, mqtt_manager):
@@ -21,7 +22,13 @@ class NodeController:
         self.node_model = NodeModel(gateway_id=self.GATEWAY_ID)
         self.serial_lock = threading.Lock()
         self.pause_sensor_request = threading.Event()
+        self.pause_sensor_request.clear()  # Explicitly set initial state to False
         self.mqtt_manager = mqtt_manager
+        
+        # Ensure MQTT connection
+        if not self.mqtt_manager.is_connected():
+            self.mqtt_manager.connect()
+            time.sleep(1)  # Give it a moment to establish connection
 
     def decode_hex_response(self,hex_data):
           
@@ -54,26 +61,34 @@ class NodeController:
         self.pause_sensor_request.set()
         node_id = data.get('nodeId')
         state = data.get('state')
+        correlation_id = data.get('correlation_id')
         ser = None
+        lock_acquired = False
 
         try:
             # Give time for sensor monitoring to notice the pause
             time.sleep(0.5)
             
             if not node_id or not state:
-                return jsonify({'message': 'Missing required fields'}), 400
+                return {
+                    'success': False,
+                    'message': 'Missing required fields'
+                }
 
             if self.node_model.node_exists(node_id):
-                return jsonify({'message': 'Node already exists'}), 400
+                return {
+                    'success': False,
+                    'message': 'Node already exists'
+                }
 
-            # Wait for sensor thread to release lock
-            wait_start = time.time()
-            while self.serial_lock.locked() and (time.time() - wait_start) < 8:
-                time.sleep(0.5)
-                logging.debug("Waiting for serial lock to be released...")
-
-            if not self.serial_lock.acquire(timeout=8):
-                return jsonify({'message': 'Could not acquire serial port access'}), 500
+            # Try to acquire the lock with timeout
+            if not self.serial_lock.acquire(timeout=10):
+                return {
+                    'success': False,
+                    'message': 'Serial port is busy, please try again later'
+                }
+            
+            lock_acquired = True
 
             # Try opening the port multiple times
             max_attempts = 3
@@ -89,9 +104,6 @@ class NodeController:
                     else:
                         raise e
 
-            if ser is None:
-                raise SerialException("Failed to open serial port after multiple attempts")
-
             # Clear buffers
             ser.reset_input_buffer()
             ser.reset_output_buffer()
@@ -101,7 +113,10 @@ class NodeController:
             hex_message = self.encode_message(message)
             
             if not hex_message:
-                raise ValueError("Failed to encode message")
+                return {
+                    'success': False,
+                    'message': 'Failed to encode message'
+                }
 
             # Format AT command
             at_command = f"AT+PSEND={hex_message}\r\n"
@@ -110,319 +125,288 @@ class NodeController:
             # Send the AT command
             ser.write(at_command.encode('ascii'))
             ser.flush()
-            logging.debug(f"Command sent successfully")
-
-            # Wait for response
-            max_wait = 7
-            start_time = time.time()
-            
-            while (time.time() - start_time) < max_wait:
-                if ser.in_waiting:
-                    try:
-                        response = ser.readline().decode('ascii').strip()
-                        logging.debug(f"Received raw response: {response}")
-                        
-                        # Check if response is in EVT:RXP2P format
-                        if "EVT:RXP2P" in response:
-                            # Parse the hex data from the response
-                            parts = response.split(':')
-                            if len(parts) >= 5:
-                                hex_data = parts[4].strip()  # Get the hex data and remove any whitespace
-                                logging.debug(f"Extracted hex data: {hex_data}")
-                                
-                                # Convert hex to ASCII
-                                try:
-                                    # For your specific case: 4E323031303031473130303130313930
-                                    # This should decode to: N201001G10010190
-                                    ascii_response = self.decode_hex_response(hex_data)
-                                    logging.debug(f"Decoded ASCII response: {ascii_response}")
-                                    
-                                    # Extract node ID and check if it matches
-                                    received_node_id = ascii_response[:7]  # N201001modify the 
-                                    received_gateway_id = ascii_response[7:14]  # G100101
-                                    received_status = ascii_response[14:]  # 90
-                                    
-                                    logging.debug(f"Parsed values - Node ID: {received_node_id}, Gateway ID: {received_gateway_id}, Status: {received_status}")
-                                    
-                                    if received_node_id == node_id and received_status == "90":
-                                        result = self.node_model.save_node(node_id, self.GATEWAY_ID)
-                                        return jsonify({'message': 'Node enrolled successfully', 'data': result}), 200
-                                    elif received_status == "80":
-                                        return jsonify({'message': 'Node enrollment rejected by device'}), 400
-                                
-                                except ValueError as e:
-                                    logging.error(f"Error decoding hex data: {str(e)}")
-                                    continue
-                    
-                    except Exception as e:
-                        logging.error(f"Error parsing response: {str(e)}")
-                        continue
-                    
-                time.sleep(0.1)
-            
-            return jsonify({'message': 'Timeout waiting for node response'}), 500
-
-        except SerialException as e:
-            logging.error(f"Serial port error: {str(e)}")
-            return jsonify({'message': f'Serial port error: {str(e)}'}), 500
-        except Exception as e:
-            logging.error(f"Unexpected error: {str(e)}")
-            return jsonify({'message': f'Error enrolling node: {str(e)}'}), 500
-        finally:
-            if ser:
-                try:
-                    ser.close()
-                    logging.debug("Serial port closed successfully")
-                except Exception as e:
-                    logging.error(f"Error closing serial port: {str(e)}")
-            if self.serial_lock.locked():
-                self.serial_lock.release()
-            self.pause_sensor_request.clear()
-    def control_relay(self, data):
-        self.pause_sensor_request.set()
-        if not self.serial_lock:
-            return jsonify({'message': 'Serial lock not initialized'}), 500
-            
-        self.pause_sensor_request.set()
-        node_id = data.get('nodeId')
-        relay_number = data.get('relayNumber')
-        relay_state = data.get('relayState')
-        state = data.get('state')
-        
-        ser = None
-        lock_acquired = False
-        
-        try:
-            # Wait briefly for sensor monitoring to notice the pause
-            time.sleep(0.5)
-            
-            # Try to acquire lock with timeout
-            if not self.serial_lock.acquire(timeout=6):
-                logging.warning("Could not acquire serial lock82432727 - timeout")
-                return jsonify({'message': 'Could not acquire serial port access - timeout'}), 500
-                
-            lock_acquired = True
-            logging.debug("Serial lock acquired successfully")
-            
-            # Open serial port
-            ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=10)
-            
-            # Clear buffers
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            
-            # Format relay command
-            relay_code = '00' if relay_number == 1 else '01'
-            message = f"{node_id}{self.GATEWAY_ID}{state}{relay_code}{relay_state}"
-            hex_message = self.encode_message(message)
-            
-            if not hex_message:
-                raise ValueError("Failed to encode message")
-            
-            # Send command
-            at_command = f"AT+PSEND={hex_message}\r\n"
-            logging.debug(f"Sending command: {at_command}")
-            ser.write(at_command.encode('ascii'))
-            ser.flush()
             
             # Wait for response
             start_time = time.time()
             while (time.time() - start_time) < 15:
                 if ser.in_waiting:
                     response = ser.readline().decode('ascii').strip()
-                    logging.debug(f"Received response: {response}")
+                    logging.debug(f"Received raw response: {response}")
                     
                     if "EVT:RXP2P" in response:
                         parts = response.split(':')
                         if len(parts) >= 5:
                             hex_data = parts[4].strip()
                             ascii_response = self.decode_hex_response(hex_data)
+                            
                             if ascii_response:
-                                received_node_id = ascii_response[7:14]
+                                received_node_id = ascii_response[:7]
                                 received_status = ascii_response[14:]
                                 
-                                if received_node_id == node_id:
-                                    if received_status == "92":
-                                        self.node_model.update_relay_state(node_id, f'relay{relay_number}_state', relay_state)
-                                        return jsonify({
-                                            'message': f'Relay {relay_number} state updated successfully',
-                                            'nodeId': node_id,
-                                            'relayNumber': relay_number,
-                                            'state': relay_state
-                                        }), 200
-                                    elif received_status == "82":
-                                        return jsonify({'message': 'Relay control rejected by device'}), 400
-            
+                                if received_node_id == node_id and received_status == "90":
+                                    result = self.node_model.save_node(node_id, self.GATEWAY_ID)
+                                    response_data = {
+                                        'success': True,
+                                        'message': 'Node enrolled successfully',
+                                        'data': result
+                                    }
+                                    return response_data
+                                elif received_status == "80":
+                                    return {
+                                        'success': False,
+                                        'message': 'Node enrollment rejected by device'
+                                    }
+                
                 time.sleep(0.1)
-                
-            return jsonify({'message': 'Timeout waiting for relay response'}), 500
-                
+            
+            return {
+                'success': False,
+                'message': 'Timeout waiting for node response'
+            }
+
         except SerialException as e:
             logging.error(f"Serial port error: {str(e)}")
-            return jsonify({'message': f'Serial port error: {str(e)}'}), 500
+            return {
+                'success': False,
+                'message': f'Serial port error: {str(e)}'
+            }
         except Exception as e:
-            logging.error(f"Error in control_relay: {str(e)}")
-            return jsonify({'message': f'Error controlling relay: {str(e)}'}), 500
-            
+            logging.error(f"Unexpected error: {str(e)}")
+            return {
+                'success': False,
+                'message': f'Error enrolling node: {str(e)}'
+            }
         finally:
             if ser:
                 try:
                     ser.close()
-                    logging.debug("Serial port closed")
                 except Exception as e:
                     logging.error(f"Error closing serial port: {str(e)}")
-                    
             if lock_acquired:
                 try:
                     self.serial_lock.release()
-                    logging.debug("Serial lock released")
                 except Exception as e:
                     logging.error(f"Error releasing lock: {str(e)}")
-                    
             self.pause_sensor_request.clear()
-            logging.debug("Sensor request pause cleared")
-      
+    def control_relay(self, data):
+        self.pause_sensor_request.set()
+        ser = None
+        lock_acquired = False
+        
+        try:
+            # Give time for sensor monitoring to notice the pause
+            time.sleep(0.5)
+            
+            node_id = data.get('nodeId')
+            relay_number = data.get('relayNumber')
+            relay_state = data.get('relayState')
+            state = data.get('state', '20')
+            
+            # Validate inputs
+            if str(relay_number) not in ['1', '2']:
+                return {
+                    'success': False,
+                    'message': 'Invalid relay number. Must be 1 or 2'
+                }
+            
+            # Wait for sensor thread to release lock
+            wait_start = time.time()
+            while self.serial_lock.locked() and (time.time() - wait_start) < 8:
+                time.sleep(0.5)
+                logging.debug("Waiting for serial lock to be released...")
+
+            if not self.serial_lock.acquire(timeout=8):
+                return {
+                    'success': False,
+                    'message': 'Could not acquire serial port access'
+                }
+            
+            lock_acquired = True
+            
+            # Rest of the existing control_relay code...
+            relay_code = '00' if relay_number == 1 else '01'
+            message = f"{node_id}{self.GATEWAY_ID}{state}{relay_code}{relay_state}"
+            hex_message = self.encode_message(message)
+            
+            if not hex_message:
+                return {
+                    'success': False,
+                    'message': 'Failed to encode message'
+                }
+            
+            response = self._send_serial_command(hex_message)
+            return response
+            
+        except Exception as e:
+            logging.error(f"Error controlling relay: {str(e)}")
+            return {
+                'success': False,
+                'message': f'Error controlling relay: {str(e)}'
+            }
+        finally:
+            if lock_acquired:
+                try:
+                    self.serial_lock.release()
+                except Exception as e:
+                    logging.error(f"Error releasing lock: {str(e)}")
+            self.pause_sensor_request.clear()
+
     def periodic_sensor_data_request(self):
         while True:
             try:
+                # Initial pause check
                 if self.pause_sensor_request.is_set():
-                    logging.debug("Sensor request paused")
-                    if 'ser' in locals():
-                        ser.close()     
-                    if self.serial_lock.locked():
-                        self.serial_lock.release()
-                    logging.debug("Sensor request paused, waiting...")
-                    time.sleep(0.1)
+                    logging.debug("Sensor requests are paused, waiting...")
+                    time.sleep(0.5)
                     continue
 
-                if not self.serial_lock.acquire(timeout=0.2):
-                    logging.debug("Could not acquire serial lock, retrying...")
-                    continue
-
-                try:
-                    nodes = self.node_model.get_all_nodes()
-                except Exception as e:
-                    logging.error(f"Error getting nodes: {str(e)}")
-                    time.sleep(1)
-                    continue
-
+                nodes = self.node_model.get_all_nodes()
                 if not nodes:
-                    logging.info("No nodes found in database")
-                    time.sleep(5)
+                    logging.info("No nodes found for sensor data request")
+                    time.sleep(5)  # Wait longer when no nodes found
                     continue
 
-                for node in nodes:
-                    if self.pause_sensor_request.is_set():
-                        logging.info("Sensor data request paused")
-                        logging.debug("Sensor request paused")
-                        if 'ser' in locals():
-                             ser.close()     
-                        if self.serial_lock.locked():
-                             self.serial_lock.release()
-                        logging.debug("Sensor request paused, waiting...")
-                        time.sleep(0.1)
-                        continue
-
-                    node_id = node['node_id']
+                with self.serial_lock:
+                    ser = None
                     try:
-                        ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=7)
-                        logging.info(f"Opened serial port: {self.SERIAL_PORT}")
-
-                        # Clear buffers
-                        ser.reset_input_buffer()
-                        ser.reset_output_buffer()
-
-                        # Format sensor request command
-                        message = f"{node_id}{self.GATEWAY_ID}10"
-                        hex_message = binascii.hexlify(message.encode('ascii')).decode('ascii')
-                        at_command = f"AT+PSEND={hex_message}\r\n"
-
-                        logging.debug(f"Sending sensor request to node {node_id}")
-                        logging.debug(f"Command: {at_command}")
-
-                        ser.write(at_command.encode('ascii'))
-                        ser.flush()
-                        logging.info("Command sent successfully.")
-
-                        start_time = time.time()
-                        response_received = False
-
-                        while (time.time() - start_time) < 3:  # 5 second timeout
-                            if ser.in_waiting:
-                                try:
-                                    response = ser.readline().decode('ascii').strip()
-                                    logging.debug(f"Received response: {response}")
-
-                                    if "EVT:RXP2P" in response:
-                                        parts = response.split(':')
-                                        if len(parts) >= 5:
-                                            hex_data = parts[4].strip()
-                                            try:
-                                                binary_data = binascii.unhexlify(hex_data)
-                                                sensor_data = binary_data.decode('ascii')
-
-                                                if sensor_data:
-                                                    sensor_values = sensor_data[14:]  # Skip node_id and gateway_id
-                                                    logging.info(f"Node {node_id} - Sensor Data: {sensor_values}")
-                                                    
-                                                    # Process and publish sensor data
-                                                    self.process_sensor_data(node_id, sensor_values)
-                                                    response_received = True
-                                                    break
-
-                                            except binascii.Error as e:
-                                                logging.error(f"Binascii error decoding sensor data from node {node_id}: {str(e)}")
-                                            except UnicodeDecodeError as e:
-                                                logging.error(f"Unicode decode error from node {node_id}: {str(e)}")
-                                except UnicodeDecodeError as e:
-                                    logging.error(f"Error decoding serial response: {str(e)}")
-                                    continue
-
+                        # Check pause state after acquiring lock
+                        if self.pause_sensor_request.is_set():
+                            logging.debug("Sensor request paused after lock acquisition")
+                            if self.serial_lock.locked():
+                                self.serial_lock.release()
                             time.sleep(0.1)
+                            continue
 
-                        if not response_received:
-                            logging.warning(f"No response received from node {node_id}")
+                        # Serial port setup code...
+                        ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=7)
+                        
+                        for node in nodes:
+                            # Check pause state before each node request
+                            if self.pause_sensor_request.is_set():
+                                logging.debug("Sensor request paused before node processing")
+                                if ser:
+                                    ser.close()
+                                if self.serial_lock.locked():
+                                    self.serial_lock.release()
+                                time.sleep(0.1)
+                                break
 
-                    except SerialException as e:
-                        logging.error(f"Serial port error in sensor request: {str(e)}")
+                            node_id = node['node_id']
+                            retry_count = 0
+                            max_retries = 1
+                            
+                            while retry_count < max_retries:
+                                try:
+                                    # Clear buffers
+                                    ser.reset_input_buffer()
+                                    ser.reset_output_buffer()
+                                    
+                                    # Rest of the existing node processing code...
+                                    message = f"{node_id}{self.GATEWAY_ID}10"
+                                    hex_message = self.encode_message(message)
+                                    if not hex_message:
+                                        logging.error(f"Failed to encode message for node {node_id}")
+                                        break
+                                        
+                                    at_command = f"AT+PSEND={hex_message}\r\n"
+                                    ser.write(at_command.encode('ascii'))
+                                    ser.flush()
+                                    
+                                    # Existing response handling code...
+                                    start_time = time.time()
+                                    response_received = False
+                                    
+                                    while (time.time() - start_time) < 7:
+                                        # Check pause state during response wait
+                                        if self.pause_sensor_request.is_set():
+                                            logging.debug("Sensor request paused during response wait")
+                                            if ser:
+                                                ser.close()
+                                            if self.serial_lock.locked():
+                                                self.serial_lock.release()
+                                            break
+                                        
+                                        if ser.in_waiting:
+                                            response = ser.readline().decode('ascii').strip()
+                                            if "EVT:RXP2P" in response:
+                                                # Existing response processing code...
+                                                parts = response.split(':')
+                                                if len(parts) >= 5:
+                                                    hex_data = parts[4].strip()
+                                                    sensor_data = self.decode_hex_response(hex_data)
+                                                    if sensor_data and len(sensor_data) >= 14:
+                                                        self.process_sensor_data(node_id, sensor_data[14:])
+                                                        response_received = True
+                                                        break
+                                        time.sleep(0.1)
+                                    
+                                    if response_received or self.pause_sensor_request.is_set():
+                                        break
+                                        
+                                    retry_count += 1
+                                    if retry_count < max_retries:
+                                        logging.warning(f"Retrying sensor request for node {node_id}")
+                                        time.sleep(2)
+                                        
+                                except Exception as e:
+                                    logging.error(f"Error requesting sensor data from node {node_id}: {e}")
+                                    retry_count += 1
+                                    if retry_count < max_retries:
+                                        time.sleep(2)
+                        
+                            if self.pause_sensor_request.is_set():
+                                break
+                                
+                            time.sleep(2)  # Wait between nodes
+                            
                     finally:
-                        if 'ser' in locals():
-                            ser.close()
-
-                    # Wait before requesting from next node
-                    time.sleep(2)
-
-                logging.info("=== Sensor Data Request Completed ===\n")
-
+                        if ser:
+                            try:
+                                ser.close()
+                                logging.debug("Serial port closed successfully")
+                            except Exception as e:
+                                logging.error(f"Error closing serial port: {str(e)}")
+                            
             except Exception as e:
-                logging.error(f"Error in periodic sensor data request: {str(e)}")
-                time.sleep(1)
-            finally:
-                if self.serial_lock.locked():
-                    self.serial_lock.release()
+                logging.error(f"Error in periodic sensor data request: {e}")
+                if ser:
+                    try:
+                        ser.close()
+                    except:
+                        pass
 
     def process_sensor_data(self, node_id, sensor_data):
         try:
-            # Convert sensor data to JSON
-            data = {
-                'node_id': node_id,
-                'gateway_id': self.GATEWAY_ID,
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'sensor_data': sensor_data
-            }
+            # Maximum retries for MQTT publishing
+            max_retries = 3
+            retry_delay = 2
             
-            # Publish to MQTT using the correct method
-            if self.mqtt_manager:
+            for attempt in range(max_retries):
+                if not self.mqtt_manager.is_connected():
+                    logging.warning(f"MQTT not connected. Attempting to reconnect... (Attempt {attempt + 1}/{max_retries})")
+                    if not self.mqtt_manager.connect():
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            logging.error("Failed to establish MQTT connection after all retries")
+                            return
+                
                 success = self.mqtt_manager.publish_sensor_data(
                     gateway_id=self.GATEWAY_ID,
                     node_id=node_id,
                     sensor_data=sensor_data
                 )
+                
                 if success:
-                    logging.info(f"Published sensor data for node {node_id}")
+                    logging.info(f"Published sensor data for node {node_id}: {sensor_data}")
+                    return
+                elif attempt < max_retries - 1:
+                    logging.warning(f"Failed to publish sensor data, retrying... (Attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
                 else:
-                    logging.warning(f"Failed to publish sensor data for node {node_id}")
-            
+                    logging.error("Failed to publish sensor data after all retries")
+                    
         except Exception as e:
             logging.error(f"Error processing sensor data: {str(e)}")
 
@@ -430,9 +414,7 @@ class NodeController:
         self.pause_sensor_request.set()
         node_id = data.get('nodeId')
         state = data.get('state')
-        
-        ser = None
-        lock_acquired = False  # Track if lock was acquired
+        correlation_id = data.get('correlation_id')
         
         try:
             # Wait briefly for sensor monitoring to notice the pause
@@ -479,7 +461,18 @@ class NodeController:
                                 if received_node_id == node_id:
                                     if received_status == "97":
                                         self.node_model.delete_node(node_id)
-                                        return jsonify({'message': 'Node unenrolled successfully'}), 200
+                                        response = {
+                                            'success': True,
+                                            'message': 'Node unenrolled successfully'
+                                        }
+                                        if self.mqtt_manager:
+                                            self.mqtt_manager._publish_response(
+                                                self.GATEWAY_ID,
+                                                'UNENROLL_NODE',
+                                                response,
+                                                correlation_id
+                                            )
+                                        return response
                                     elif received_status == "87":
                                         return jsonify({'message': 'Node unenrollment rejected by device'}), 400
             
@@ -532,5 +525,41 @@ class NodeController:
         except Exception as e:
             logging.warning(f"Error cleaning up ports: {str(e)}")
 
+    def _send_serial_command(self, hex_message, timeout=15):
+        ser = None
+        try:
+            ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=timeout)
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            at_command = f"AT+PSEND={hex_message}\r\n"
+            ser.write(at_command.encode('ascii'))
+            ser.flush()
+            
+            start_time = time.time()
+            while (time.time() - start_time) < timeout:
+                if ser.in_waiting:
+                    response = ser.readline().decode('ascii').strip()
+                    
+                    if "EVT:RXP2P" in response:
+                        parts = response.split(':')
+                        if len(parts) >= 5:
+                            hex_data = parts[4].strip()
+                            ascii_response = self.decode_hex_response(hex_data)
+                            
+                            if ascii_response:
+                                received_status = ascii_response[14:]
+                                if received_status == "92":
+                                    return {'success': True}
+                                elif received_status == "82":
+                                    return {'success': False, 'message': 'Command rejected by device'}
+                                
+                time.sleep(0.1)
+                
+            return {'success': False, 'message': 'Command timeout'}
+            
+        finally:
+            if ser:
+                ser.close()
 
 __all__ = ['NodeController']

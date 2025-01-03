@@ -4,58 +4,97 @@ from helper.gateway_storage import GatewayStorage
 import os
 
 class GatewayController:
-    def __init__(self):
+    def __init__(self, mqtt_manager):
         self.gateway_storage = GatewayStorage()
+        self.mqtt_manager = mqtt_manager
+        self.gateway_id = os.getenv('GATEWAY_ID', 'G100101')
         
     def register_gateway(self, data):
         received_gateway_id = data.get('gateway_id')
+        correlation_id = data.get('correlation_id')
+        
         if not received_gateway_id:
-            return jsonify({'message': 'Missing gateway ID'}), 400
+            response = {
+                'success': False,
+                'message': 'Missing gateway ID'
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
+            return response
 
-        # Get the program's gateway ID from environment
         program_gateway_id = os.getenv('GATEWAY_ID')
         
         if not program_gateway_id:
-            return jsonify({'message': 'Program gateway ID not configured'}), 400
+            response = {
+                'success': False,
+                'message': 'Program gateway ID not configured'
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
+            return response
             
         if received_gateway_id != program_gateway_id:
-            return jsonify({'message': 'Gateway ID mismatch'}), 403
+            response = {
+                'success': False,
+                'message': 'Gateway ID mismatch'
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
+            return response
 
         try:
-            # Save gateway ID to local storage
             self.gateway_storage.enroll_gateway(received_gateway_id)
             
-            # Start sensor monitoring after successful enrollment
             from app import start_sensor_monitoring
             import threading
             sensor_thread = threading.Thread(target=start_sensor_monitoring, daemon=True)
             sensor_thread.start()
-            logging.info("Sensor monitoring thread started after gateway enrollment")
             
-            return jsonify({
+            response = {
+                'success': True,
                 'message': 'Gateway enrolled successfully',
                 'gateway_id': received_gateway_id,
                 'status': 'enrolled'
-            }), 200
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
+            return response
+            
         except Exception as e:
             logging.error(f"Error registering gateway: {str(e)}")
-            return jsonify({'message': f'Error registering gateway: {str(e)}'}), 500
+            response = {
+                'success': False,
+                'message': f'Error registering gateway: {str(e)}'
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
+            return response
 
-    def unregister_gateway(self):
+    def unregister_gateway(self, data=None):
+        correlation_id = data.get('correlation_id') if data else None
+        
         try:
             self.gateway_storage.unenroll_gateway()
             if 'GATEWAY_ID' in os.environ:
                 del os.environ['GATEWAY_ID']
-            return jsonify({'message': 'Gateway unregistered successfully'}), 200
+            
+            response = {
+                'success': True,
+                'message': 'Gateway unregistered successfully'
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'UNREGISTER_GATEWAY', response, correlation_id)
+            return response
+            
         except Exception as e:
             logging.error(f"Error unregistering gateway: {str(e)}")
-            return jsonify({'message': f'Error unregistering gateway: {str(e)}'}), 500
+            response = {
+                'success': False,
+                'message': f'Error unregistering gateway: {str(e)}'
+            }
+            self.mqtt_manager._publish_response(self.gateway_id, 'UNREGISTER_GATEWAY', response, correlation_id)
+            return response
 
     def check_gateway_status(self):
-        return jsonify({
+        return {
+            'success': True,
             'is_enrolled': self.gateway_storage.is_enrolled(),
             'gateway_id': self.gateway_storage.get_gateway_id()
-        }), 200
+        }
 
 
   
