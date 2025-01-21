@@ -3,9 +3,11 @@ import logging
 import json
 from datetime import datetime, timezone
 import os
-from config import MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE, MQTT_CLIENT_ID, MQTT_QOS, MQTT_RETRY_INTERVAL, MQTT_MAX_RETRIES
+from config import MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE, MQTT_CLIENT_ID, MQTT_QOS, MQTT_RETRY_INTERVAL, MQTT_MAX_RETRIES, MQTT_TLS_ENABLED, MQTT_TLS_INSECURE
 import time
 import threading
+import ssl
+import certifi
 
 class MQTTManager:
     _instance = None
@@ -24,8 +26,19 @@ class MQTTManager:
         self.client = mqtt.Client(
             client_id=MQTT_CLIENT_ID,
             clean_session=True,
-            protocol=mqtt.MQTTv31,
+            protocol=mqtt.MQTTv311,
             transport="tcp"
+        )
+        
+        # Configure TLS
+        if MQTT_TLS_ENABLED:
+            self.client.tls_set()
+            self.client.tls_insecure_set(MQTT_TLS_INSECURE)
+        
+        # Set username and password
+        self.client.username_pw_set(
+            username=os.getenv('MQTT_USERNAME', 'shahidvega'),
+            password=os.getenv('MQTT_PASSWORD', 'Shahidvega123')
         )
         
         self.client.on_connect = self._on_connect
@@ -49,10 +62,11 @@ class MQTTManager:
             
             # Subscribe to gateway command topic
             command_topic = f"gateway/{self.gateway_id}/command"
-            self.client.subscribe(command_topic)
-            logging.info(f"Subscribed to command topic: {command_topic}")
+            status_topic = f"gateway/{self.gateway_id}/status"
+            self.client.subscribe([(command_topic, 1), (status_topic, 1)])
+            logging.info(f"Subscribed to topics: {command_topic}, {status_topic}")
             
-            # Publish connection status
+            # Publish initial connection status
             self._publish_gateway_status("connected")
         else:
             self.connected = False

@@ -1,9 +1,24 @@
 [
+  
   {
-    "node_id": "N201004",
+    "node_id": "N201008",
     "gateway_id": "G100101",
     "relay1_state": "0",
     "relay2_state": "0",
-    "timestamp": "2025-01-02T11:34:49.522733"
+    "timestamp": "2025-01-19T10:46:24.639621"
+  },
+  {
+    "node_id": "N201005",
+    "gateway_id": "G100101",
+    "relay1_state": "0",
+    "relay2_state": "0",
+    "timestamp": "2025-01-20T04:41:06.580162"
+  },
+  {
+    "node_id": "N201001",
+    "gateway_id": "G100101",
+    "relay1_state": "0",
+    "relay2_state": "0",
+    "timestamp": "2025-01-20T10:30:21.704452"
   }
 ]

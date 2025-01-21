@@ -30,22 +30,36 @@ class NodeController:
             self.mqtt_manager.connect()
             time.sleep(1)  # Give it a moment to establish connection
 
-    def decode_hex_response(self,hex_data):
-          
-          try:
-            #remove any whitespace
-            hex_data=hex_data.strip()
-            if len(hex_data) % 2!=0:
-                    logging.error(f"invalid hex data length: {len(hex_data)}")
-                    return None
+    def decode_hex_response(self, hex_data):
+        try:
+            hex_data = hex_data.strip()
+            if len(hex_data) % 2 != 0:
+                logging.error(f"invalid hex data length: {len(hex_data)}")
+                return None
 
-            #convert byte to hex response
-            ascii_response= bytes.fromhex(hex_data).decode('ascii', errors='replace')
-            logging.debug(f"decoded ascii response: {ascii_response} ")
+            ascii_response = bytes.fromhex(hex_data).decode('ascii', errors='replace')
+            logging.debug(f"Raw hex data: {hex_data}")
+            logging.debug(f"Decoded ascii response: {ascii_response}")
+            
+            # The format is: NODE_ID(7) + GATEWAY_ID(7) + STATE(2) + sensor1,sensor2
+            # Extract just the sensor data portion (after the first 16 characters)
+            sensor_portion = ascii_response[16:]  # Skip NODE_ID(7) + GATEWAY_ID(7) + STATE(2)
+            logging.debug(f"Sensor values portion: {sensor_portion}")
+            
+            # Split and validate sensor values
+            try:
+                sensor_values = sensor_portion.split(',')
+                if len(sensor_values) == 2:
+                    sensor1 = float(sensor_values[0])
+                    sensor2 = float(sensor_values[1])
+                    logging.debug(f"Parsed raw ADC values - Sensor1: {sensor1}, Sensor2: {sensor2}")
+            except ValueError as e:
+                logging.error(f"Error parsing sensor values: {str(e)}")
+            
             return ascii_response
-          except ValueError as e:
-              logging.error(f"error decoding hex data:{str(e)}")
-              return None
+        except ValueError as e:
+            logging.error(f"error decoding hex data:{str(e)}")
+            return None
 
     def encode_message(self, message):
         try:
@@ -215,7 +229,7 @@ class NodeController:
                 time.sleep(0.5)
                 logging.debug("Waiting for serial lock to be released...")
 
-            if not self.serial_lock.acquire(timeout=8):
+            if not self.serial_lock.acquire(timeout=10):
                 return {
                     'success': False,
                     'message': 'Could not acquire serial port access'
@@ -263,7 +277,7 @@ class NodeController:
                 nodes = self.node_model.get_all_nodes()
                 if not nodes:
                     logging.info("No nodes found for sensor data request")
-                    time.sleep(5)  # Wait longer when no nodes found
+                    time.sleep(0.3)  # Wait longer when no nodes found
                     continue
 
                 with self.serial_lock:
@@ -278,7 +292,7 @@ class NodeController:
                             continue
 
                         # Serial port setup code...
-                        ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=7)
+                        ser = Serial(self.SERIAL_PORT, self.SERIAL_BAUDRATE, timeout=1)
                         
                         for node in nodes:
                             # Check pause state before each node request
@@ -357,7 +371,7 @@ class NodeController:
                             if self.pause_sensor_request.is_set():
                                 break
                                 
-                            time.sleep(2)  # Wait between nodes
+                            time.sleep(0)  # Wait between nodes
                             
                     finally:
                         if ser:
@@ -377,35 +391,53 @@ class NodeController:
 
     def process_sensor_data(self, node_id, sensor_data):
         try:
-            # Maximum retries for MQTT publishing
-            max_retries = 3
-            retry_delay = 2
+            logging.debug(f"Processing raw sensor data: {sensor_data}")
             
-            for attempt in range(max_retries):
-                if not self.mqtt_manager.is_connected():
-                    logging.warning(f"MQTT not connected. Attempting to reconnect... (Attempt {attempt + 1}/{max_retries})")
-                    if not self.mqtt_manager.connect():
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay)
-                            continue
-                        else:
-                            logging.error("Failed to establish MQTT connection after all retries")
+            # Remove the state code (first 2 characters) from sensor data
+            sensor_data = sensor_data[2:]  # Skip the state code
+            logging.debug(f"Sensor data after removing state: {sensor_data}")
+            
+            values = sensor_data.split(',')
+            logging.debug(f"Split sensor values: {values}")
+            
+            if len(values) == 2:
+                try:
+                    # Keep raw ADC values
+                    sensor1 = float(values[0])
+                    sensor2 = float(values[1])
+                    logging.debug(f"Raw ADC values - Sensor1: {sensor1}, Sensor2: {sensor2}")
+                    
+                    # Maximum retries for MQTT publishing
+                    max_retries = 3
+                    retry_delay = 2
+                    
+                    for attempt in range(max_retries):
+                        if not self.mqtt_manager.is_connected():
+                            logging.warning(f"MQTT not connected. Attempting to reconnect... (Attempt {attempt + 1}/{max_retries})")
+                            if not self.mqtt_manager.connect():
+                                if attempt < max_retries - 1:
+                                    time.sleep(retry_delay)
+                                    continue
+                                else:
+                                    logging.error("Failed to establish MQTT connection after all retries")
+                                    return
+                        
+                        success = self.mqtt_manager.publish_sensor_data(
+                            gateway_id=self.GATEWAY_ID,
+                            node_id=node_id,
+                            sensor_data=sensor_data  # This will now contain only the sensor values
+                        )
+                        
+                        if success:
+                            logging.info(f"Published sensor data for node {node_id}: {sensor_data}")
                             return
-                
-                success = self.mqtt_manager.publish_sensor_data(
-                    gateway_id=self.GATEWAY_ID,
-                    node_id=node_id,
-                    sensor_data=sensor_data
-                )
-                
-                if success:
-                    logging.info(f"Published sensor data for node {node_id}: {sensor_data}")
-                    return
-                elif attempt < max_retries - 1:
-                    logging.warning(f"Failed to publish sensor data, retrying... (Attempt {attempt + 1}/{max_retries})")
-                    time.sleep(retry_delay)
-                else:
-                    logging.error("Failed to publish sensor data after all retries")
+                        elif attempt < max_retries - 1:
+                            logging.warning(f"Failed to publish sensor data, retrying... (Attempt {attempt + 1}/{max_retries})")
+                            time.sleep(retry_delay)
+                        else:
+                            logging.error("Failed to publish sensor data after all retries")
+                except ValueError as e:
+                    logging.error(f"Error parsing sensor values: {str(e)}")
                     
         except Exception as e:
             logging.error(f"Error processing sensor data: {str(e)}")

@@ -8,93 +8,96 @@ class GatewayController:
         self.gateway_storage = GatewayStorage()
         self.mqtt_manager = mqtt_manager
         self.gateway_id = os.getenv('GATEWAY_ID', 'G100101')
+        self.status = 'disconnected'
         
-    def register_gateway(self, data):
-        received_gateway_id = data.get('gateway_id')
-        correlation_id = data.get('correlation_id')
-        
-        if not received_gateway_id:
-            response = {
-                'success': False,
-                'message': 'Missing gateway ID'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
-            return response
-
-        program_gateway_id = os.getenv('GATEWAY_ID')
-        
-        if not program_gateway_id:
-            response = {
-                'success': False,
-                'message': 'Program gateway ID not configured'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
-            return response
-            
-        if received_gateway_id != program_gateway_id:
-            response = {
-                'success': False,
-                'message': 'Gateway ID mismatch'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
-            return response
-
-        try:
-            self.gateway_storage.enroll_gateway(received_gateway_id)
-            
-            from app import start_sensor_monitoring
-            import threading
-            sensor_thread = threading.Thread(target=start_sensor_monitoring, daemon=True)
-            sensor_thread.start()
-            
-            response = {
-                'success': True,
-                'message': 'Gateway enrolled successfully',
-                'gateway_id': received_gateway_id,
-                'status': 'enrolled'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
-            return response
-            
-        except Exception as e:
-            logging.error(f"Error registering gateway: {str(e)}")
-            response = {
-                'success': False,
-                'message': f'Error registering gateway: {str(e)}'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'REGISTER_GATEWAY', response, correlation_id)
-            return response
-
-    def unregister_gateway(self, data=None):
-        correlation_id = data.get('correlation_id') if data else None
-        
-        try:
-            self.gateway_storage.unenroll_gateway()
-            if 'GATEWAY_ID' in os.environ:
-                del os.environ['GATEWAY_ID']
-            
-            response = {
-                'success': True,
-                'message': 'Gateway unregistered successfully'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'UNREGISTER_GATEWAY', response, correlation_id)
-            return response
-            
-        except Exception as e:
-            logging.error(f"Error unregistering gateway: {str(e)}")
-            response = {
-                'success': False,
-                'message': f'Error unregistering gateway: {str(e)}'
-            }
-            self.mqtt_manager._publish_response(self.gateway_id, 'UNREGISTER_GATEWAY', response, correlation_id)
-            return response
+        # Set initial status if MQTT is connected
+        if self.mqtt_manager.is_connected():
+            self.status = 'connected'
+            self.mqtt_manager._publish_gateway_status('connected')
 
     def check_gateway_status(self):
+        # Update status based on MQTT connection
+        self.status = 'connected' if self.mqtt_manager.is_connected() else 'disconnected'
+        
         return {
             'success': True,
             'is_enrolled': self.gateway_storage.is_enrolled(),
-            'gateway_id': self.gateway_storage.get_gateway_id()
+            'gateway_id': self.gateway_id,
+            'status': self.status,
+            'mqtt_connected': self.mqtt_manager.is_connected()
         }
+
+    def register_gateway(self, data):
+        try:
+            received_gateway_id = data.get('gateway_id')
+            correlation_id = data.get('correlation_id')
+            
+            if not received_gateway_id:
+                return self._handle_registration_error('Missing gateway ID', correlation_id)
+                
+            if received_gateway_id != self.gateway_id:
+                return self._handle_registration_error('Gateway ID mismatch', correlation_id)
+
+            # Ensure MQTT connection before registration
+            if not self.mqtt_manager.is_connected():
+                if not self.mqtt_manager.connect():
+                    return self._handle_registration_error('Failed to connect to MQTT broker', correlation_id)
+
+            self.gateway_storage.enroll_gateway(received_gateway_id)
+            self.status = 'connected'
+            
+            # Publish gateway status
+            self.mqtt_manager._publish_gateway_status('connected')
+            
+            response = {
+                'success': True,
+                'message': 'Gateway registered successfully',
+                'gateway_id': received_gateway_id,
+                'status': self.status
+            }
+            
+            return response
+            
+        except Exception as e:
+            return self._handle_registration_error(str(e), correlation_id)
+
+    def unregister_gateway(self):
+        try:
+            self.gateway_storage.unenroll_gateway()
+            self.status = 'disconnected'
+            
+            # Publish disconnected status
+            if self.mqtt_manager.is_connected():
+                self.mqtt_manager._publish_gateway_status('disconnected')
+            
+            return {
+                'success': True,
+                'message': 'Gateway unregistered successfully',
+                'status': self.status
+            }
+            
+        except Exception as e:
+            logging.error(f"Error unregistering gateway: {str(e)}")
+            return {
+                'success': False,
+                'message': str(e),
+                'status': self.status
+            }
+
+    def _handle_registration_error(self, message, correlation_id):
+        response = {
+            'success': False,
+            'message': message,
+            'status': self.status
+        }
+        if self.mqtt_manager.is_connected():
+            self.mqtt_manager._publish_response(
+                self.gateway_id, 
+                'REGISTER_GATEWAY', 
+                response, 
+                correlation_id
+            )
+        return response
 
 
   

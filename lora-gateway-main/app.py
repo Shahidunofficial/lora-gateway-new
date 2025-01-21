@@ -10,6 +10,8 @@ from router.gatewayRoutes import gateway_blueprint, mqtt_manager_instance
 import threading
 from controller_instance import init_controller, get_controller
 import time
+import ssl
+import certifi
 
 # Configure logging
 logging.basicConfig(
@@ -30,7 +32,8 @@ sio = socketio.Client(
     reconnection_delay=1,
     reconnection_delay_max=5,
     randomization_factor=0.5,
-    handle_sigint=False
+    handle_sigint=False,
+    ssl_verify=True  # Only use the supported SSL parameter
 )
 
 def get_local_ip():
@@ -44,45 +47,45 @@ def get_local_ip():
         logging.error(f"Error getting local IP: {e}")
         return "127.0.0.1"
 
-def connect_to_server():
-    while True:  # Keep trying to connect
-        try:
-            websocket_url = os.getenv('WEBSOCKET_SERVER_URL', 'http://192.168.43.231:5000')
-            logging.info(f"Attempting to connect to server at {websocket_url}")
+# def connect_to_server():
+#     while True:  # Keep trying to connect
+#         try:
+#             websocket_url =  'https://wms-backend-trh1.onrender.com'
+#             logging.info(f"Attempting to connect to server at {websocket_url}")
             
-            @sio.event
-            def connect():
-                logging.info("Connected to WebSocket server")
-                # Register gateway
-                gateway_data = {
-                    "gatewayId": os.getenv('GATEWAY_ID', 'G100101'),
-                    "ipAddress": get_local_ip(),
-                    "port": int(os.getenv('PORT', 8080))
-                }
-                sio.emit('register_device', gateway_data)
-                logging.info(f"Emitted register_device with data: {gateway_data}")
+#             @sio.event
+#             def connect():
+#                 logging.info("Connected to WebSocket server")
+#                 # Register gateway
+#                 gateway_data = {
+#                     "gatewayId": os.getenv('GATEWAY_ID', 'G100101'),
+#                     "ipAddress": get_local_ip(),
+#                     "port": int(os.getenv('PORT', 8080))
+#                 }
+#                 sio.emit('register_device', gateway_data)
+#                 logging.info(f"Emitted register_device with data: {gateway_data}")
             
-            @sio.event
-            def connect_error(data):
-                logging.error(f"Connection failed: {data}")
+#             @sio.event
+#             def connect_error(data):
+#                 logging.error(f"Connection failed: {data}")
             
-            @sio.event
-            def disconnect():
-                logging.warning("Disconnected from server")
+#             @sio.event
+#             def disconnect():
+#                 logging.warning("Disconnected from server")
             
-            # Connect with explicit transport and options
-            sio.connect(
-                websocket_url,
-                transports=['websocket', 'polling'],
-                wait_timeout=10,
-                wait=True,
-                socketio_path='socket.io'
-            )
-            break  # If connection successful, break the loop
+#             # Connect with explicit transport and options
+#             sio.connect(
+#                 websocket_url,
+#                 transports=['websocket', 'polling'],
+#                 wait_timeout=10,
+#                 wait=True,
+#                 socketio_path='socket.io'
+#             )
+#             break  # If connection successful, break the loop
             
-        except Exception as e:
-            logging.error(f"Error connecting to server: {str(e)}")
-            time.sleep(5)  # Wait before retrying
+#         except Exception as e:
+#             logging.error(f"Error connecting to server: {str(e)}")
+#             time.sleep(5)  # Wait before retrying
 
 def start_sensor_monitoring():
     try:
@@ -151,11 +154,6 @@ if __name__ == '__main__':
         if not configure_app():
             logging.warning("Application configured with limited functionality")
         
-        # Connect to server for IP registration in a separate thread
-        server_thread = threading.Thread(target=connect_to_server, daemon=True)
-        server_thread.start()
-        logging.info("Server connection thread started")
-        
         # Start Flask app
         host = '0.0.0.0'
         port = int(os.getenv('PORT', 8080))
@@ -165,7 +163,7 @@ if __name__ == '__main__':
         app.run(
             host=host,
             port=port,
-            debug=True,
+            debug=debug,
             use_reloader=False
         )
     except Exception as e:
