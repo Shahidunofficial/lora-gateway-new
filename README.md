@@ -45,5 +45,6 @@ sudo systemctl start lora-gateway.service
 
 sudo systemctl status lora-gateway.service
 
-journalctl -u lora-gateway.service
+journalctl -u lora-gateway.service -f
+
 
